@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using GameEngine.Configuration;
@@ -50,29 +49,24 @@ public sealed class SpinHandler
         var roundId = CreateRoundId();
         Console.WriteLine($"[SpinHandler] RoundId created: {roundId}");
         
-        // ═══════════════════════════════════════════════════════════════════════════════════════
-        // STATE RESTORATION: Per RGS spec, try EngineState first, then lastResponse as fallback
-        // This supports platforms that forward lastResponse instead of maintaining EngineState
-        // ═══════════════════════════════════════════════════════════════════════════════════════
         var nextState = request.EngineState?.Clone() ?? EngineSessionState.Create();
         
-        // If EngineState was null but lastResponse is provided, try to restore from it
-        if (request.EngineState is null && request.LastResponse.HasValue)
+        // CRITICAL: Clear respin state if it's invalid or exhausted BEFORE determining spin mode
+        // This prevents stale respin state from incorrectly setting spinMode to Respin
+        if (nextState.Respins is not null)
         {
-            var restoredState = TryRestoreStateFromLastResponse(request.LastResponse.Value);
-            if (restoredState != null)
+            // Clear if respins are exhausted (feature has ended)
+            if (nextState.Respins.RespinsRemaining <= 0)
             {
-                Console.WriteLine("[SpinHandler] Restored state from lastResponse.results.feature");
-                nextState = restoredState;
+                Console.WriteLine($"[SpinHandler] Clearing respin state (respins exhausted: {nextState.Respins.RespinsRemaining})");
+                nextState.Respins = null;
             }
-        }
-        
-        // CRITICAL: Clear respin state only when starting a new session (no state sent).
-        // When respins are exhausted we keep state (and cache) so follow-up requests get the same response with respinsRemaining=0.
-        if (nextState.Respins is not null && request.EngineState is null)
-        {
-            Console.WriteLine("[SpinHandler] Clearing respin state (new session, no previous state)");
-            nextState.Respins = null;
+            // Clear if request.EngineState is null (completely new session)
+            else if (request.EngineState is null)
+            {
+                Console.WriteLine($"[SpinHandler] Clearing respin state (new session, no previous state)");
+                nextState.Respins = null;
+            }
         }
         
         // Determine spin mode AFTER clearing invalid respin state
@@ -82,89 +76,22 @@ public sealed class SpinHandler
             : nextState.IsInRespinFeature ? SpinMode.Respin
             : SpinMode.BaseGame;
         
+        // Additional safety: If we determined BaseGame but respin state still exists, clear it
+        if (spinMode == SpinMode.BaseGame && nextState.Respins is not null)
+        {
+            Console.WriteLine($"[SpinHandler] Clearing stale respin state (determined BaseGame but respin state exists: {nextState.Respins.RespinsRemaining} respins)");
+            nextState.Respins = null;
+        }
+        
         Console.WriteLine($"[SpinHandler] SpinMode: {spinMode}, RespinsRemaining: {nextState.Respins?.RespinsRemaining ?? 0}, LockedReels: {(nextState.Respins?.LockedWildReels != null && nextState.Respins.LockedWildReels.Count > 0 ? string.Join(",", nextState.Respins.LockedWildReels.Select(r => r + 1)) : "none")}, RequestHadRespinState: {request.EngineState?.Respins != null}");
 
-        // Per RGS spec, accept 'bet' as primary, 'totalBet' as fallback
-        // If neither provided, calculate from bets[].amount sum
+        // Use bet field if provided (per RGS spec), otherwise use TotalBet
+        // bet = calculated total bet as sum of all amounts in bets array
         var effectiveBet = request.Bet ?? request.TotalBet;
-        if (effectiveBet.Amount <= 0 && request.Bets?.Count > 0)
-        {
-            var calculatedTotal = request.Bets.Sum(b => b.Amount.Amount);
-            effectiveBet = new Money(calculatedTotal);
-            Console.WriteLine($"[SpinHandler] Using calculated bet from bets array: {calculatedTotal}");
-        }
 
         var buyCost = request.IsFeatureBuy
             ? Money.FromBet(request.BaseBet.Amount, configuration.BuyFeature.CostMultiplier)
             : Money.Zero;
-
-        // ═══════════════════════════════════════════════════════════════════════════════════════
-        // RETURN CACHED RESPONSE: Frontend may send up to 3 play requests for the same scenario.
-        // Return the same grid/win each time with respinsRemaining decrementing (e.g. 1 → 0 → 0).
-        // ═══════════════════════════════════════════════════════════════════════════════════════
-        if (nextState.Respins is not null && nextState.Respins.CachedGridIds is not null && nextState.Respins.CachedTotalWin is not null)
-        {
-            var respinsBefore = nextState.Respins.RespinsRemaining;
-            if (nextState.Respins.RespinsRemaining > 0)
-            {
-                nextState.Respins.RespinsRemaining -= 1;
-                nextState.Respins.JustTriggered = false;
-            }
-            Console.WriteLine($"[SpinHandler] Returning cached response (same grid/win): RespinsRemaining {respinsBefore} -> {nextState.Respins.RespinsRemaining}");
-
-            var cachedGrid = nextState.Respins.CachedGridIds;
-            var cachedWin = nextState.Respins.CachedTotalWin.Value;
-            var cachedWins = nextState.Respins.CachedWins ?? Array.Empty<SymbolWin>();
-            var winsWithCoords = cachedWins.Count > 0 && cachedWins[0].Coordinates is null
-                ? AddCoordinatesToWins(cachedWins.ToList(), configuration.Board.Columns, configuration.Board.Rows)
-                : cachedWins.ToList();
-
-            var cachedCascade = new CascadeStep(
-                Index: 0,
-                GridBefore: cachedGrid,
-                GridAfter: cachedGrid,
-                WinsAfterCascade: cachedWins.ToList(),
-                BaseWin: cachedWin,
-                AppliedMultiplier: 1m,
-                TotalWin: cachedWin);
-
-            var isClosure = nextState.Respins.RespinsRemaining == 0 ? 1 : 0;
-            var featureOutcomeCached = new FeatureOutcome(
-                Type: "EXPANDING_WILDS",
-                IsClosure: isClosure,
-                Name: "Starburst Wilds",
-                Active: nextState.Respins.RespinsRemaining > 0,
-                RespinsAwarded: nextState.Respins.TotalRespinsAwarded,
-                RespinsRemaining: nextState.Respins.RespinsRemaining,
-                LockedReels: nextState.Respins.LockedWildReels?.ToList(),
-                ExpandingWilds: null,
-                InitialGrid: null);
-            var resultsFeatureCached = CreateResultsFeature(featureOutcomeCached, nextState, cachedGrid);
-
-            var cachedResponse = new PlayResponse(
-                StatusCode: 200,
-                Win: cachedWin,
-                ScatterWin: Money.Zero,
-                FeatureWin: Money.Zero,
-                BuyCost: buyCost,
-                FreeSpins: 0,
-                RoundId: roundId,
-                Timestamp: _timeService.UtcNow,
-                NextState: nextState,
-                Results: new ResultsEnvelope(
-                    Cascades: new List<CascadeStep> { cachedCascade },
-                    Wins: winsWithCoords,
-                    Scatter: null,
-                    FreeSpins: null,
-                    RngTransactionId: roundId,
-                    FinalGridSymbols: cachedGrid,
-                    Stops: null,
-                    TotalWin: cachedWin,
-                    Feature: resultsFeatureCached),
-                Message: "Request processed successfully",
-                Feature: featureOutcomeCached);
-            return cachedResponse;
-        }
 
         var reelStrips = SelectReelStrips(configuration, spinMode, request.BetMode);
         Console.WriteLine($"[SpinHandler] Reel strips selected: {reelStrips.Count} reels");
@@ -193,115 +120,14 @@ public sealed class SpinHandler
         }
         Console.WriteLine($"[SpinHandler] lockedReelsForBoardCreation: {(lockedReelsForBoardCreation != null ? $"Count={lockedReelsForBoardCreation.Count}, Reels=[{string.Join(", ", lockedReelsForBoardCreation)}]" : "null")}");
 
-        // Resolve cheat/fun fields: use top-level if set, else read from UserPayload (RGS only forwards userPayload)
-        var (effectiveFunMode, effectiveStops, effectiveDebugEnabled) = ResolveCheatFromRequest(request, reelStrips.Count);
-
-        // Cheat path: when FunMode + DebugEnabled + valid Stops (base game only), build board from requested stops
-        ReelBoard board;
-        string? customGridValidationError = null; // Store validation error to return in response (fun mode custom grid only)
-        IReadOnlyList<int>? cheatStops = null;
-        var allowCheat = effectiveFunMode
-            && effectiveDebugEnabled
-            && effectiveStops != null
-            && effectiveStops.Length == reelStrips.Count
-            && spinMode == SpinMode.BaseGame;
-
-        if (allowCheat)
-        {
-            Console.WriteLine("[SpinHandler] ===== CHEAT MODE (stop-based) =====");
-            ValidateStopsForCheat(effectiveStops!, reelStrips);
-            board = CreateBoardFromStops(effectiveStops!, reelStrips, configuration, multiplierFactory);
-            cheatStops = effectiveStops;
-            Console.WriteLine($"[SpinHandler] Board built from requested stops: [{string.Join(", ", effectiveStops!)}]");
-            Console.WriteLine("[SpinHandler] =====================================");
-        }
-        else if (effectiveFunMode && spinMode == SpinMode.BaseGame)
-        {
-            Console.WriteLine("[SpinHandler] ===== FUN MODE ACTIVE (BASE GAME) =====");
-            
-            IReadOnlyList<int>? funModeGrid = null;
-            
-            // Check for custom grid in UserPayload (only in fun mode)
-            Console.WriteLine($"[SpinHandler] Checking UserPayload for custom grid. HasValue: {request.UserPayload.HasValue}");
-            if (request.UserPayload.HasValue)
-            {
-                Console.WriteLine($"[SpinHandler] UserPayload content: {request.UserPayload.Value}");
-                if (request.UserPayload.Value.TryGetProperty("customFunModeGrid", out var gridElement))
-                {
-                    Console.WriteLine($"[SpinHandler] ✅ Custom grid found in UserPayload!");
-                    try
-                    {
-                        var gridArray = gridElement.EnumerateArray().Select(e => e.GetInt32()).ToArray();
-                        Console.WriteLine($"[SpinHandler] Parsed grid array: [{string.Join(", ", gridArray)}]");
-                        Console.WriteLine($"[SpinHandler] Grid length: {gridArray.Length}, Expected: {configuration.Board.Columns * configuration.Board.Rows}");
-                        
-                        if (gridArray.Length == configuration.Board.Columns * configuration.Board.Rows)
-                        {
-                            Console.WriteLine("[SpinHandler] Custom grid found in UserPayload - validating against reel strips...");
-                            ValidateCustomGridAgainstReelStrips(gridArray, reelStrips, configuration);
-                            funModeGrid = gridArray;
-                            Console.WriteLine("[SpinHandler] ✅ Custom grid validated successfully! Will be used for this spin.");
-                        }
-                        else
-                        {
-                            customGridValidationError = $"Custom grid has wrong size ({gridArray.Length}), expected {configuration.Board.Columns * configuration.Board.Rows}.";
-                            Console.WriteLine($"[SpinHandler] WARNING: {customGridValidationError} Using random grid instead.");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        customGridValidationError = ex.Message;
-                        Console.WriteLine($"[SpinHandler] ERROR: Custom grid validation failed: {ex.Message}. Using random grid instead.");
-                    }
-                }
-                else
-                {
-                    Console.WriteLine("[SpinHandler] No 'customFunModeGrid' property found in UserPayload");
-                }
-            }
-            else
-            {
-                Console.WriteLine("[SpinHandler] UserPayload is null or has no value");
-            }
-            
-            if (funModeGrid == null)
-            {
-                Console.WriteLine("[SpinHandler] Using pre-configured grid instead of RNG");
-                funModeGrid = FunModeGridProvider.GetRandomGrid(_fortunaPrng);
-                Console.WriteLine($"[SpinHandler] Selected fun mode grid (random from {FunModeGridProvider.GridCount} available grids)");
-            }
-            else
-            {
-                Console.WriteLine("[SpinHandler] Using CUSTOM user-input grid (fun mode)");
-            }
-            
-            board = CreateFunModeBoard(funModeGrid, configuration, multiplierFactory);
-            Console.WriteLine("[SpinHandler] ============================");
-        }
-        else
-        {
-            if (effectiveFunMode && spinMode == SpinMode.Respin)
-            {
-                Console.WriteLine("[SpinHandler] ===== FUN MODE ACTIVE (RESPIN) =====");
-                Console.WriteLine("[SpinHandler] Respins use normal RNG (not pre-configured grids) to preserve locked reels");
-                Console.WriteLine("[SpinHandler] =====================================");
-            }
-            else
-            {
-                Console.WriteLine("[SpinHandler] ===== NORMAL MODE (RNG) =====");
-                Console.WriteLine("[SpinHandler] request.FunMode = false - Using RNG to generate random grid");
-                Console.WriteLine("[SpinHandler] ==============================");
-            }
-            // Normal board creation with RNG (used for both normal mode and fun mode respins)
-            board = ReelBoard.Create(
-                reelStrips,
-                configuration.SymbolMap,
-                configuration.Board.Rows,
-                multiplierFactory,
-                randomContext.ReelStartSeeds,
-                _fortunaPrng,
-                lockedReelsForBoardCreation);
-        }
+        var board = ReelBoard.Create(
+            reelStrips,
+            configuration.SymbolMap,
+            configuration.Board.Rows,
+            multiplierFactory,
+            randomContext.ReelStartSeeds,
+            _fortunaPrng,
+            lockedReelsForBoardCreation);
         Console.WriteLine("[SpinHandler] Board created");
         
         // IMPORTANT: Capture the initial grid BEFORE wild expansion for visual animation
@@ -323,14 +149,12 @@ public sealed class SpinHandler
             Console.WriteLine($"[SpinHandler] No initial wild reels detected (before expansions)");
         }
         
-        // Keep all detected wild reels so the frontend can animate all wild positions/reels.
-        // This applies to both cheat/fun mode and normal RNG mode.
-        
         // Capture initial expanding wilds information (before expansion) for feature state
         // This captures which reels have wilds and which rows they appear on
         var initialExpandingWilds = DetectExpandingWilds(board, initialWildReels);
         
         // Starburst: Wilds can appear on reels 2, 3, 4 (indices 1, 2, 3)
+        // Multiple wild reels are allowed - each awards a respin (max 3 respins)
         // During respins, wild reels are locked and only non-locked reels re-spin
         
         // Handle wild expansion based on spin mode
@@ -612,57 +436,24 @@ public sealed class SpinHandler
 
         Console.WriteLine($"[SpinHandler] Creating response: TotalWin={totalWin.Amount}, Wins={wins.Count}, Cascades={cascades.Count}");
         
-        // Include custom grid validation error in message if present
-        var responseMessage = customGridValidationError != null 
-            ? customGridValidationError 
-            : "Request processed successfully";
-        
-        // ═══════════════════════════════════════════════════════════════════════════════════════
-        // RGS COMPLIANCE: Calculate stops, add coordinates, create results feature
-        // ═══════════════════════════════════════════════════════════════════════════════════════
-        
-        // Calculate actual reel stop positions for frontend animation (use requested stops when cheat path was used)
-        var stops = cheatStops ?? randomContext.CalculateStops(reelStrips, lockedReelsForBoardCreation);
-        Console.WriteLine($"[SpinHandler] Reel stops calculated: [{string.Join(", ", stops)}]");
-        
-        // Add x/y coordinates to all wins for frontend animation
-        var winsWithCoordinates = AddCoordinatesToWins(wins, configuration.Board.Columns, configuration.Board.Rows);
-        Console.WriteLine($"[SpinHandler] Added coordinates to {winsWithCoordinates.Count} wins");
-        
-        // Cache grid/win when respins remain so follow-up requests get the same response with respins decrementing
-        if (nextState.Respins != null && nextState.Respins.RespinsRemaining > 0)
-        {
-            nextState.Respins.CachedGridIds = finalGrid;
-            nextState.Respins.CachedTotalWin = totalWin;
-            nextState.Respins.CachedWins = winsWithCoordinates;
-            Console.WriteLine("[SpinHandler] Cached response for follow-up requests (same grid/win, respins decrementing)");
-        }
-        
-        // Create ResultsFeature for safe forwarding to frontend (inside results object)
-        var resultsFeature = CreateResultsFeature(featureOutcome, nextState, initialGrid);
-        
         var response = new PlayResponse(
             StatusCode: 200,
             Win: totalWin,
             ScatterWin: Money.Zero, // No scatter symbols in Starburst
             FeatureWin: featureSummary?.FeatureWin ?? Money.Zero,
             BuyCost: buyCost,
-            FreeSpins: freeSpinsAwarded, // Renamed from FreeSpinsAwarded per RGS spec
+            FreeSpinsAwarded: freeSpinsAwarded,
             RoundId: roundId,
             Timestamp: _timeService.UtcNow,
             NextState: nextState,
             Results: new ResultsEnvelope(
                 Cascades: cascades,
-                Wins: winsWithCoordinates, // Now includes coordinates
+                Wins: wins,
                 Scatter: null, // No scatter symbols in Starburst
                 FreeSpins: null, // No free spins feature in Starburst
                 RngTransactionId: roundId,
-                FinalGridSymbols: finalGrid,
-                // NEW: Per RGS spec for frontend
-                Stops: stops,
-                TotalWin: totalWin,
-                Feature: resultsFeature),
-            Message: responseMessage,
+                FinalGridSymbols: finalGrid),
+            Message: "Request processed successfully",
             Feature: featureOutcome);
 
         _telemetry.Record(new SpinTelemetryEvent(
@@ -698,28 +489,11 @@ public sealed class SpinHandler
         // EngineState can be null - it will be created if null (see line 44)
         // Validation removed to allow null engineState for first spin
 
-        // Per RGS spec:
-        // - BetType in bets[] is optional - only amount is guaranteed
-        // - Accept 'bet' as alias for 'totalBet'
-        // - Can calculate total bet from bets[].amount sum if neither bet nor totalBet provided
+        // Validate bet: use bet field if provided (per RGS spec), otherwise TotalBet
         var betToValidate = request.Bet ?? request.TotalBet;
-        
-        // If neither bet nor totalBet is provided, calculate from bets array
-        if (betToValidate.Amount <= 0 && request.Bets.Count > 0)
-        {
-            var calculatedTotal = request.Bets.Sum(b => b.Amount.Amount);
-            if (calculatedTotal > 0)
-            {
-                Console.WriteLine($"[SpinHandler] Calculated total bet from bets array: {calculatedTotal}");
-                // Note: We can't modify betToValidate here as it's for validation only
-                // The actual calculation happens in effectiveBet assignment above
-                betToValidate = new Money(calculatedTotal);
-            }
-        }
-        
         if (betToValidate.Amount <= 0)
         {
-            throw new ArgumentException("Bet amount must be positive. Provide 'bet', 'totalBet', or bets with amounts.", nameof(request.Bet));
+            throw new ArgumentException("Bet amount must be positive.", nameof(request.Bet));
         }
     }
 
@@ -728,8 +502,33 @@ public sealed class SpinHandler
         SpinMode mode,
         BetMode betMode)
     {
-        // Single reel set (reelsetBase) used for all modes: base game, buy entry, and respin
-        return configuration.ReelLibrary.High;
+        // Note: No free spins feature in Starburst - only base game, buy entry, and respin
+        return mode switch
+        {
+            SpinMode.BuyEntry => configuration.ReelLibrary.Buy,
+            SpinMode.Respin => SelectBaseReels(configuration), // Use base reels for respins
+            _ => SelectBaseReels(configuration) // Base game - always use standard bet mode
+        };
+    }
+
+    private IReadOnlyList<IReadOnlyList<string>> SelectBaseReels(GameConfiguration configuration)
+    {
+        // Note: No ante bet mode in Starburst - only standard bet mode
+        if (!configuration.BetModes.TryGetValue("standard", out var modeDefinition))
+        {
+            return configuration.ReelLibrary.High;
+        }
+
+        var lowWeight = Math.Max(0, modeDefinition.ReelWeights.Low);
+        var highWeight = Math.Max(0, modeDefinition.ReelWeights.High);
+        var total = lowWeight + highWeight;
+        if (total <= 0)
+        {
+            return configuration.ReelLibrary.High;
+        }
+
+        var roll = _fortunaPrng.NextInt32(0, total);
+        return roll < lowWeight ? configuration.ReelLibrary.Low : configuration.ReelLibrary.High;
     }
 
     private async Task<RandomContext> FetchRandomContext(
@@ -865,273 +664,6 @@ public sealed class SpinHandler
     }
 
     /// <summary>
-    /// Creates a board from a fun mode grid (pre-configured grid).
-    /// Fun mode grid is a flat array of 15 symbol IDs (0-based indices in symbol catalog).
-    /// Layout: Column-major order (reel 0: indices 0,1,2, reel 1: indices 3,4,5, etc.)
-    /// </summary>
-    private ReelBoard CreateFunModeBoard(
-        IReadOnlyList<int> funModeGrid,
-        GameConfiguration configuration,
-        Func<SymbolDefinition, decimal> multiplierFactory)
-    {
-        var expectedSize = configuration.Board.Columns * configuration.Board.Rows;
-        if (funModeGrid.Count != expectedSize)
-        {
-            throw new ArgumentException(
-                $"Fun mode grid must have {expectedSize} symbols (got {funModeGrid.Count}). " +
-                $"Grid is column-major: [reel0_row0, reel0_row1, reel0_row2, reel1_row0, ...]");
-        }
-
-        var columns = new List<ReelColumn>(configuration.Board.Columns);
-        var symbolCatalog = configuration.SymbolCatalog;
-
-        for (int col = 0; col < configuration.Board.Columns; col++)
-        {
-            var symbols = new List<SymbolInstance>();
-            
-            for (int row = 0; row < configuration.Board.Rows; row++)
-            {
-                // Convert column-major index to flat index
-                int flatIndex = col * configuration.Board.Rows + row;
-                int symbolId = funModeGrid[flatIndex];
-                
-                if (symbolId < 0 || symbolId >= symbolCatalog.Count)
-                {
-                    throw new ArgumentException(
-                        $"Invalid symbol ID {symbolId} at position [{col},{row}] (flat index {flatIndex}). " +
-                        $"Must be between 0 and {symbolCatalog.Count - 1}.");
-                }
-                
-                var symbolDef = symbolCatalog[symbolId];
-                var multiplier = multiplierFactory(symbolDef);
-                symbols.Add(new SymbolInstance(symbolDef, multiplier));
-            }
-            
-            // Create a ReelColumn with a dummy strip (won't be used since we replace symbols)
-            // We need to use the first symbol's Sym value for the dummy strip
-            var dummyStrip = new List<string> { symbolCatalog[0].Sym };
-            var column = new ReelColumn(dummyStrip, 0, configuration.Board.Rows, configuration.SymbolMap, multiplierFactory);
-            
-            // Replace the symbols with our fun mode symbols
-            column.Symbols.Clear();
-            column.Symbols.AddRange(symbols);
-            
-            columns.Add(column);
-        }
-
-        Console.WriteLine("[SpinHandler] Created FUN MODE board with pre-configured grid");
-        LogFunModeGrid(funModeGrid, configuration);
-        
-        return ReelBoard.CreateFromColumns(columns, configuration.Board.Rows);
-    }
-
-    /// <summary>
-    /// Logs the fun mode grid in a readable format for debugging.
-    /// </summary>
-    private void LogFunModeGrid(IReadOnlyList<int> funModeGrid, GameConfiguration configuration)
-    {
-        Console.WriteLine("[SpinHandler] ===== FUN MODE GRID LAYOUT =====");
-        Console.WriteLine("Column-major order (as provided):");
-        Console.WriteLine($"  [{string.Join(", ", funModeGrid)}]");
-        Console.WriteLine("Visual representation (5 columns × 3 rows):");
-        for (int row = 0; row < configuration.Board.Rows; row++)
-        {
-            var rowSymbols = new List<string>();
-            for (int col = 0; col < configuration.Board.Columns; col++)
-            {
-                int flatIndex = col * configuration.Board.Rows + row;
-                int symbolId = funModeGrid[flatIndex];
-                var symbolDef = configuration.SymbolCatalog[symbolId];
-                rowSymbols.Add($"{symbolDef.Code}({symbolId})");
-            }
-            var rowLabel = row == 0 ? "TOP" : row == 1 ? "MID" : "BOT";
-            Console.WriteLine($"  {rowLabel} ROW: [{string.Join(" | ", rowSymbols)}]");
-        }
-        Console.WriteLine("[SpinHandler] =================================");
-    }
-
-    /// <summary>
-    /// Validates stop indices for cheat path: each stop must be in range [0, strip.Length) for its reel.
-    /// </summary>
-    /// <summary>
-    /// Resolves funMode, stops, and debugEnabled from the request.
-    /// Uses top-level fields first; when RGS forwards only userPayload, reads from UserPayload (funMode, stops, debugEnabled, or cheat[0].stops).
-    /// </summary>
-    private static (bool FunMode, int[]? Stops, bool DebugEnabled) ResolveCheatFromRequest(PlayRequest request, int reelCount)
-    {
-        var funMode = request.FunMode;
-        var stops = request.Stops;
-        var debugEnabled = request.DebugEnabled;
-
-        if (request.UserPayload.HasValue)
-        {
-            var up = request.UserPayload.Value;
-            if (!funMode && up.TryGetProperty("funMode", out var fmEl))
-                funMode = fmEl.ValueKind == JsonValueKind.Number ? fmEl.GetInt32() == 1 : fmEl.GetBoolean();
-            if (stops == null && up.TryGetProperty("stops", out var stopsEl) && stopsEl.ValueKind == JsonValueKind.Array)
-            {
-                var list = new List<int>();
-                foreach (var e in stopsEl.EnumerateArray())
-                    if (e.TryGetInt32(out var v)) list.Add(v);
-                if (list.Count == reelCount)
-                    stops = list.ToArray();
-            }
-            if (!debugEnabled && up.TryGetProperty("debugEnabled", out var dbgEl))
-                debugEnabled = dbgEl.ValueKind == JsonValueKind.True || (dbgEl.ValueKind == JsonValueKind.Number && dbgEl.GetInt32() == 1);
-            if (stops == null && (up.TryGetProperty("cheat", out var cheatEl) || up.TryGetProperty("cheats", out cheatEl)) && cheatEl.ValueKind == JsonValueKind.Array && cheatEl.GetArrayLength() > 0)
-            {
-                var first = cheatEl[0];
-                if (first.TryGetProperty("stops", out var csEl) && csEl.ValueKind == JsonValueKind.Array)
-                {
-                    var list = new List<int>();
-                    foreach (var e in csEl.EnumerateArray())
-                        if (e.TryGetInt32(out var v)) list.Add(v);
-                    if (list.Count == reelCount)
-                        stops = list.ToArray();
-                }
-            }
-        }
-
-        return (funMode, stops, debugEnabled);
-    }
-
-    private static void ValidateStopsForCheat(int[] stops, IReadOnlyList<IReadOnlyList<string>> reelStrips)
-    {
-        for (int r = 0; r < stops.Length; r++)
-        {
-            if (r >= reelStrips.Count)
-            {
-                throw new ArgumentException($"Stops count ({stops.Length}) must equal reel count ({reelStrips.Count}).");
-            }
-            var stripLen = reelStrips[r].Count;
-            var stop = stops[r];
-            if (stop < 0 || stop >= stripLen)
-            {
-                throw new ArgumentException(
-                    $"Invalid stop index {stop} for reel {r + 1}: must be in range [0, {stripLen}).");
-            }
-        }
-    }
-
-    /// <summary>
-    /// Builds a ReelBoard from requested stop positions (cheat path).
-    /// Stop index = top of the 3-row visible window; convention matches frontend and existing engine.
-    /// </summary>
-    private static ReelBoard CreateBoardFromStops(
-        int[] stops,
-        IReadOnlyList<IReadOnlyList<string>> reelStrips,
-        GameConfiguration configuration,
-        Func<SymbolDefinition, decimal> multiplierFactory)
-    {
-        var rows = configuration.Board.Rows;
-        var columns = new List<ReelColumn>(reelStrips.Count);
-        for (int reelIndex = 0; reelIndex < reelStrips.Count; reelIndex++)
-        {
-            var strip = reelStrips[reelIndex];
-            var stop = stops[reelIndex];
-            var L = strip.Count;
-            // Visible window: top = strip[stop], middle = strip[(stop+1)%L], bottom = strip[(stop+2)%L]
-            var windowStrip = new List<string>
-            {
-                strip[stop % L],
-                strip[(stop + 1) % L],
-                strip[(stop + 2) % L]
-            };
-            columns.Add(new ReelColumn(windowStrip, 0, rows, configuration.SymbolMap, multiplierFactory));
-        }
-        return ReelBoard.CreateFromColumns(columns, rows);
-    }
-
-    /// <summary>
-    /// Validates that each 3-symbol column (reel) appears as a contiguous sequence in the reel strip.
-    /// Grid is column-major: [reel0_row0, reel0_row1, reel0_row2, reel1_row0, ...]
-    /// Checks if the entire column sequence [top, middle, bottom] exists in the reel strip (with wrap-around).
-    /// Throws exception if any column sequence doesn't exist in its reel strip.
-    /// </summary>
-    private void ValidateCustomGridAgainstReelStrips(
-        IReadOnlyList<int> customGrid,
-        IReadOnlyList<IReadOnlyList<string>> reelStrips,
-        GameConfiguration configuration)
-    {
-        var expectedSize = configuration.Board.Columns * configuration.Board.Rows;
-        if (customGrid.Count != expectedSize)
-        {
-            throw new ArgumentException(
-                $"Custom grid must have {expectedSize} symbols (got {customGrid.Count}). " +
-                $"Grid is column-major: [reel0_row0, reel0_row1, reel0_row2, reel1_row0, ...]");
-        }
-
-        for (int col = 0; col < configuration.Board.Columns; col++)
-        {
-            if (col >= reelStrips.Count)
-            {
-                throw new ArgumentException($"Custom grid references reel {col + 1}, but only {reelStrips.Count} reels exist.");
-            }
-
-            var reelStrip = reelStrips[col];
-            
-            // Extract the 3-symbol column sequence for this reel
-            var columnSymbols = new List<string>();
-            for (int row = 0; row < configuration.Board.Rows; row++)
-            {
-                int flatIndex = col * configuration.Board.Rows + row;
-                int symbolId = customGrid[flatIndex];
-
-                if (symbolId < 0 || symbolId >= configuration.SymbolCatalog.Count)
-                {
-                    throw new ArgumentException(
-                        $"Invalid symbol ID {symbolId} at position [{col},{row}] (flat index {flatIndex}). " +
-                        $"Must be between 0 and {configuration.SymbolCatalog.Count - 1}.");
-                }
-
-                var symbolDef = configuration.SymbolCatalog[symbolId];
-                columnSymbols.Add(symbolDef.Sym);
-            }
-
-            // Check if this 3-symbol sequence appears anywhere in the reel strip (with wrap-around)
-            bool sequenceFound = false;
-            int stripLength = reelStrip.Count;
-            
-            // Check all possible starting positions in the reel strip
-            for (int startPos = 0; startPos < stripLength; startPos++)
-            {
-                bool matches = true;
-                for (int i = 0; i < columnSymbols.Count; i++)
-                {
-                    int pos = (startPos + i) % stripLength; // Wrap around if needed
-                    if (reelStrip[pos] != columnSymbols[i])
-                    {
-                        matches = false;
-                        break;
-                    }
-                }
-                
-                if (matches)
-                {
-                    sequenceFound = true;
-                    break;
-                }
-            }
-
-            if (!sequenceFound)
-            {
-                var symbolCodes = columnSymbols.Select(sym => 
-                {
-                    var symbolDef = configuration.SymbolCatalog.FirstOrDefault(sd => sd.Sym == sym);
-                    return symbolDef?.Code ?? sym;
-                }).ToList();
-                
-                throw new InvalidOperationException(
-                    $"Custom grid does not exist: Reel {col + 1} column sequence [{string.Join(", ", symbolCodes)}] " +
-                    $"(Sym=[{string.Join(", ", columnSymbols)}]) does not appear in reel strip {col + 1}. " +
-                    $"The entire 3-symbol column must exist as a contiguous sequence in the reel.");
-            }
-        }
-        
-        Console.WriteLine("[SpinHandler] Custom grid validation passed - all reel columns exist as sequences in their reel strips.");
-    }
-
-    /// <summary>
     /// Detects wild reels on reels 2, 3, 4 (indices 1, 2, 3).
     /// Returns list of reel indices that contain wild symbols.
     /// Only detects reels that ACTUALLY have at least one wild symbol (not already expanded).
@@ -1206,18 +738,21 @@ public sealed class SpinHandler
     /// <summary>
     /// Handles Starburst Wild Respin feature:
     /// - Wilds on reels 2, 3, 4 expand and lock
-    /// - One respin is awarded per spin when any expanding wilds appear (not N respins for N wilds)
-    /// - New wilds during respins also expand and award exactly one additional respin for that spin
+    /// - Each wild reel awards one respin (max 3 respins total)
+    /// - New wilds during respins also expand and award additional respins
     /// </summary>
     private static void HandleWildRespinFeature(List<int> wildReels, EngineSessionState state, SpinMode currentMode)
     {
+        const int MAX_RESPINS = 3;
+        
         if (state.Respins is null)
         {
-            // Initialize respin feature: one respin per spin regardless of how many wilds
+            // Initialize respin feature
+            // IMPORTANT: Each wild reel awards exactly 1 respin (max 3 total)
             var newLockedReels = new HashSet<int>(wildReels);
-            const int respinsAwarded = 1;
+            var respinsAwarded = Math.Min(wildReels.Count, MAX_RESPINS);
             
-            Console.WriteLine($"[SpinHandler] Initializing respin feature: {wildReels.Count} wild reel(s) detected on reels {string.Join(", ", wildReels.Select(r => r + 1))}, awarding 1 respin (one per spin)");
+            Console.WriteLine($"[SpinHandler] Initializing respin feature: {wildReels.Count} wild reel(s) detected on reels {string.Join(", ", wildReels.Select(r => r + 1))}, awarding {respinsAwarded} respin(s)");
             
             state.Respins = new RespinState
             {
@@ -1227,28 +762,38 @@ public sealed class SpinHandler
                 JustTriggered = true
             };
             
-            Console.WriteLine($"[SpinHandler] Respin feature initialized: RespinsRemaining=1, locked reels: {string.Join(", ", newLockedReels.Select(r => r + 1))}");
+            Console.WriteLine($"[SpinHandler] Respin feature initialized: RespinsRemaining={respinsAwarded}, locked reels: {string.Join(", ", newLockedReels.Select(r => r + 1))}");
         }
         else
         {
-            // Already in respin feature - check for new wild reels on this spin
+            // Already in respin feature - check for new wild reels
             var existingLocked = state.Respins.LockedWildReels;
             var newWildReels = wildReels.Where(r => !existingLocked.Contains(r)).ToList();
             
             if (newWildReels.Count > 0)
             {
-                // New wild reels found: add to locked reels and award exactly one additional respin for this spin
-                state.Respins.RespinsRemaining += 1;
-                state.Respins.TotalRespinsAwarded += 1;
+                // New wild reels found - add them to locked reels and award additional respins
+                var totalLocked = existingLocked.Count + newWildReels.Count;
+                var maxPossibleRespins = Math.Min(totalLocked, MAX_RESPINS);
+                var currentRespins = state.Respins.RespinsRemaining;
                 
-                var updatedLocked = new HashSet<int>(existingLocked);
-                foreach (var reel in newWildReels)
+                // Award additional respins, but don't exceed max of 3 total
+                var additionalRespins = Math.Min(newWildReels.Count, maxPossibleRespins - currentRespins);
+                if (additionalRespins > 0)
                 {
-                    updatedLocked.Add(reel);
+                    state.Respins.RespinsRemaining = Math.Min(MAX_RESPINS, currentRespins + additionalRespins);
+                    state.Respins.TotalRespinsAwarded += additionalRespins;
+                    
+                    // Add new reels to locked set
+                    var updatedLocked = new HashSet<int>(existingLocked);
+                    foreach (var reel in newWildReels)
+                    {
+                        updatedLocked.Add(reel);
+                    }
+                    state.Respins.LockedWildReels = updatedLocked;
+                    
+                    Console.WriteLine($"[SpinHandler] New wild reels during respin: {string.Join(", ", newWildReels.Select(r => r + 1))}, additional respins: {additionalRespins}, total locked: {updatedLocked.Count}");
                 }
-                state.Respins.LockedWildReels = updatedLocked;
-                
-                Console.WriteLine($"[SpinHandler] New wild reels during respin: {string.Join(", ", newWildReels.Select(r => r + 1))}, awarded 1 additional respin (one per spin), total locked: {updatedLocked.Count}");
             }
         }
     }
@@ -1560,14 +1105,6 @@ public sealed class SpinHandler
             return new ReelBoard(columns, rows);
         }
 
-        /// <summary>
-        /// Creates a ReelBoard from a list of pre-constructed columns (for fun mode).
-        /// </summary>
-        public static ReelBoard CreateFromColumns(List<ReelColumn> columns, int rows)
-        {
-            return new ReelBoard(columns, rows);
-        }
-
         public bool NeedsRefill => _columns.Any(column => column.Count < _rows);
 
         public void Refill()
@@ -1851,210 +1388,6 @@ public sealed class SpinHandler
                 .ToArray();
             return FromSeeds(reelSeeds, multiplierSeeds);
         }
-        
-        /// <summary>
-        /// Calculate actual reel stop positions from seeds.
-        /// Per RGS spec, frontend needs stops[] for animation.
-        /// </summary>
-        public IReadOnlyList<int> CalculateStops(IReadOnlyList<IReadOnlyList<string>> reelStrips, IReadOnlySet<int>? lockedReels = null)
-        {
-            var stops = new List<int>(_reelSeeds.Count);
-            for (int i = 0; i < _reelSeeds.Count && i < reelStrips.Count; i++)
-            {
-                if (lockedReels != null && lockedReels.Contains(i))
-                {
-                    // Locked reel - use 0 as stop (doesn't matter, reel is frozen)
-                    stops.Add(0);
-                }
-                else
-                {
-                    // Calculate actual stop position
-                    var stripLength = reelStrips[i].Count;
-                    stops.Add(Math.Abs(_reelSeeds[i]) % stripLength);
-                }
-            }
-            return stops;
-        }
-    }
-    
-    // ═══════════════════════════════════════════════════════════════════════════════════════════
-    // HELPER METHODS FOR RGS COMPLIANCE
-    // ═══════════════════════════════════════════════════════════════════════════════════════════
-    
-    /// <summary>
-    /// Try to restore engine state from lastResponse per RGS spec.
-    /// The RGS platform may not maintain EngineState, so we support
-    /// restoring from lastResponse.results.feature as a fallback.
-    /// </summary>
-    private static EngineSessionState? TryRestoreStateFromLastResponse(JsonElement lastResponse)
-    {
-        try
-        {
-            // Navigate to results.feature
-            if (!lastResponse.TryGetProperty("results", out var results))
-            {
-                Console.WriteLine("[SpinHandler] lastResponse has no 'results' property");
-                return null;
-            }
-            
-            if (!results.TryGetProperty("feature", out var feature))
-            {
-                Console.WriteLine("[SpinHandler] lastResponse.results has no 'feature' property");
-                return null;
-            }
-            
-            // Get feature type (we restore whenever we have EXPANDING_WILDS and locked reels, even if respins=0, so we can return cached response)
-            var featureType = feature.TryGetProperty("type", out var typeElement) 
-                ? typeElement.GetString() 
-                : null;
-                
-            if (featureType != "EXPANDING_WILDS")
-            {
-                Console.WriteLine($"[SpinHandler] lastResponse.results.feature.type is '{featureType}', not EXPANDING_WILDS");
-                return null;
-            }
-            
-            // Extract respin state
-            var respinsRemaining = feature.TryGetProperty("respinsRemaining", out var remainingElement)
-                ? remainingElement.GetInt32()
-                : 0;
-                
-            var respinsAwarded = feature.TryGetProperty("respinsAwarded", out var awardedElement)
-                ? awardedElement.GetInt32()
-                : 0;
-            
-            // Extract locked reels
-            var lockedReels = new HashSet<int>();
-            if (feature.TryGetProperty("lockedReels", out var lockedReelsElement) && 
-                lockedReelsElement.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var reel in lockedReelsElement.EnumerateArray())
-                {
-                    lockedReels.Add(reel.GetInt32());
-                }
-            }
-            
-            if (lockedReels.Count == 0)
-            {
-                Console.WriteLine("[SpinHandler] lastResponse feature has no locked reels");
-                return null;
-            }
-            
-            // Restore cache from lastResponse so we can return same grid/win when respins decrement
-            IReadOnlyList<int>? cachedGridIds = null;
-            Money? cachedTotalWin = null;
-            IReadOnlyList<SymbolWin>? cachedWins = null;
-            if (lastResponse.TryGetProperty("win", out var winEl))
-            {
-                var winAmount = winEl.ValueKind == JsonValueKind.Number
-                    ? winEl.GetDecimal()
-                    : (winEl.TryGetProperty("amount", out var am) ? am.GetDecimal() : 0m);
-                cachedTotalWin = new Money(winAmount);
-            }
-            if (results.TryGetProperty("finalGridSymbols", out var gridEl) && gridEl.ValueKind == JsonValueKind.Array)
-            {
-                var list = new List<int>();
-                foreach (var e in gridEl.EnumerateArray())
-                    list.Add(e.GetInt32());
-                cachedGridIds = list;
-            }
-            if (results.TryGetProperty("wins", out var winsEl) && winsEl.ValueKind == JsonValueKind.Array)
-            {
-                var winsList = new List<SymbolWin>();
-                foreach (var w in winsEl.EnumerateArray())
-                {
-                    var symbolCode = w.TryGetProperty("symbolCode", out var sc) ? sc.GetString() ?? "" : "";
-                    var count = w.TryGetProperty("count", out var c) ? c.GetInt32() : 0;
-                    var mult = w.TryGetProperty("multiplier", out var m) ? m.GetDecimal() : 0m;
-                    var payoutEl = w.TryGetProperty("payout", out var po) && po.TryGetProperty("amount", out var am) ? am.GetDecimal() : 0m;
-                    winsList.Add(new SymbolWin(symbolCode, count, mult, new Money(payoutEl), null, null, null));
-                }
-                if (winsList.Count > 0) cachedWins = winsList;
-            }
-            
-            Console.WriteLine($"[SpinHandler] Restored from lastResponse: RespinsRemaining={respinsRemaining}, LockedReels=[{string.Join(",", lockedReels)}], HasCache={cachedGridIds != null}");
-            
-            return new EngineSessionState
-            {
-                Respins = new RespinState
-                {
-                    RespinsRemaining = respinsRemaining,
-                    TotalRespinsAwarded = respinsAwarded,
-                    LockedWildReels = lockedReels,
-                    JustTriggered = false,
-                    CachedGridIds = cachedGridIds,
-                    CachedTotalWin = cachedTotalWin,
-                    CachedWins = cachedWins
-                }
-            };
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"[SpinHandler] Error parsing lastResponse: {ex.Message}");
-            return null;
-        }
-    }
-    
-    /// <summary>
-    /// Convert flat grid indices to x/y coordinates for frontend animation.
-    /// Grid layout: x = column (reel 0-4), y = row (0=top, 2=bottom)
-    /// Flat index layout: bottom-to-top, left-to-right
-    ///   indices 0-4 = bottom row (reels 0-4)
-    ///   indices 5-9 = middle row (reels 0-4)
-    ///   indices 10-14 = top row (reels 0-4)
-    /// </summary>
-    private static IReadOnlyList<WinCoordinate> IndicesToCoordinates(IReadOnlyList<int>? indices, int columns, int rows)
-    {
-        if (indices == null || indices.Count == 0)
-            return Array.Empty<WinCoordinate>();
-        
-        var coords = new List<WinCoordinate>(indices.Count);
-        foreach (var index in indices)
-        {
-            // From flat index, calculate x (column) and y (row)
-            // Flat index = (rows - 1 - row) * columns + column
-            // So: row = rows - 1 - (index / columns), column = index % columns
-            var x = index % columns;  // Column (reel)
-            var y = rows - 1 - (index / columns);  // Row (0=top, 2=bottom)
-            coords.Add(new WinCoordinate(x, y));
-        }
-        return coords;
-    }
-    
-    /// <summary>
-    /// Add coordinates to all wins for frontend animation.
-    /// </summary>
-    private static IReadOnlyList<SymbolWin> AddCoordinatesToWins(IReadOnlyList<SymbolWin> wins, int columns, int rows)
-    {
-        return wins.Select(w => w with { 
-            Coordinates = IndicesToCoordinates(w.Indices, columns, rows) 
-        }).ToList();
-    }
-    
-    /// <summary>
-    /// Create ResultsFeature from feature state for safe forwarding to frontend.
-    /// The RGS platform forwards results as-is, so this is the safest path.
-    /// Duplicates isClosure inside results.feature so it can't be dropped by RGS transformations.
-    /// </summary>
-    private static ResultsFeature? CreateResultsFeature(
-        FeatureOutcome? featureOutcome, 
-        EngineSessionState? state,
-        IReadOnlyList<int>? initialGrid)
-    {
-        if (featureOutcome == null)
-            return null;
-            
-        // Create feature state for results object
-        // IsClosure is duplicated here from top-level feature for safe forwarding
-        return new ResultsFeature(
-            Type: featureOutcome.Type,
-            Active: featureOutcome.Active ?? false,
-            RespinsAwarded: featureOutcome.RespinsAwarded ?? 0,
-            RespinsRemaining: featureOutcome.RespinsRemaining ?? 0,
-            IsClosure: featureOutcome.IsClosure,  // Duplicated for safe forwarding to frontend
-            LockedReels: featureOutcome.LockedReels,
-            ExpandingWilds: featureOutcome.ExpandingWilds,
-            InitialGridSymbols: initialGrid);
     }
 }
 
