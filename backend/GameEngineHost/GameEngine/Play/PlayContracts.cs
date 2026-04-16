@@ -1,6 +1,5 @@
 using System.Collections.Generic;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using GameEngine.Configuration;
 
 namespace GameEngine.Play;
@@ -20,54 +19,32 @@ public sealed record PlayRequest(
     Money? Bet = null, // Calculated total bet (sum of all amounts in bets array) - IMPORTANT!
     int? RtpLevel = null, // RTP level if game supports multiple RTP (1,2,3,4 etc.)
     int? Mode = null, // Game mode: 0=normal, 1=free spin, 2=bonus game, 3=free bets
-    JsonElement? Currency = null, // Currency object with id property (e.g., {"id": "EUR"})
-    [property: JsonConverter(typeof(FunModeJsonConverter))]
-    bool FunMode = false, // If true, uses pre-configured fun mode grids instead of RNG (accepts 0/1 in JSON)
-    // Cheat/debug fields: only honored when FunMode (or Development); frontend sends as top-level
-    int[]? Stops = null,
-    bool DebugEnabled = false,
-    int[]? Multipliers = null,
-    JsonElement? Cheat = null);
+    JsonElement? Currency = null); // Currency object with id property (e.g., {"id": "EUR"})
 
-/// <summary>
-/// Bet request from RGS. Per platform spec, only 'amount' is guaranteed.
-/// BetType is optional and may not be provided by all RGS implementations.
-/// </summary>
-public sealed record BetRequest(Money Amount, string? BetType = null);
+public sealed record BetRequest(string BetType, Money Amount);
 
-/// <summary>
-/// Play response per RGS-Game server specification.
-/// Required fields: statusCode, message, win, freeSpins, results, feature
-/// </summary>
 public sealed record PlayResponse(
-    int StatusCode,           // 200 on success, other codes for errors
-    Money Win,                // Total win amount for this play/step
-    Money ScatterWin,         // Win from scatter symbols
-    Money FeatureWin,         // Win from feature (expanding wilds)
-    Money BuyCost,            // Cost if this was a feature buy
-    int FreeSpins,            // Number of free spins won (0 if none) - RENAMED from FreeSpinsAwarded per spec
-    string RoundId,           // Unique round identifier
-    DateTimeOffset Timestamp, // Server timestamp
-    EngineSessionState NextState, // Engine state for next spin
-    ResultsEnvelope Results,  // Engine-defined results object (forwarded to client as-is)
-    string Message,           // String message describing the status code
-    FeatureOutcome? Feature = null); // Feature object (type, isClosure mandatory per spec)
+    int StatusCode,
+    Money Win,
+    Money ScatterWin,
+    Money FeatureWin,
+    Money BuyCost,
+    int FreeSpinsAwarded,
+    string RoundId,
+    DateTimeOffset Timestamp,
+    EngineSessionState NextState,
+    ResultsEnvelope Results,
+    // Additional fields per RGS-Game server specification
+    string Message, // String message describing the status code
+    FeatureOutcome? Feature = null); // Feature object when feature is triggered (type, isClosure, name)
 
-/// <summary>
-/// Results envelope containing all game outcome data.
-/// This object is forwarded to the frontend as-is by the RGS platform.
-/// </summary>
 public sealed record ResultsEnvelope(
     IReadOnlyList<CascadeStep> Cascades,
     IReadOnlyList<SymbolWin> Wins,
     ScatterOutcome? Scatter,
     FeatureSummary? FreeSpins,
     string RngTransactionId,
-    IReadOnlyList<int>? FinalGridSymbols, // Symbol matrix: numeric IDs (0-based index in symbol catalog)
-    // NEW: Required by frontend per RGS spec
-    IReadOnlyList<int>? Stops = null,     // Reel stop positions [5] - one per reel
-    Money? TotalWin = null,               // Total win (duplicate of top-level for frontend convenience)
-    ResultsFeature? Feature = null);      // Feature state for safe forwarding to frontend
+    IReadOnlyList<int>? FinalGridSymbols); // Symbol matrix: numeric IDs (0-based index in symbol catalog)
 
 public sealed record CascadeStep(
     int Index,
@@ -78,23 +55,13 @@ public sealed record CascadeStep(
     decimal AppliedMultiplier,
     Money TotalWin);
 
-/// <summary>
-/// Represents a single symbol win with all details needed for frontend animation.
-/// </summary>
 public sealed record SymbolWin(
-    string SymbolCode,    // Symbol code (e.g., "BAR", "SEVEN", "RED")
-    int Count,            // Number of matching symbols
-    decimal Multiplier,   // Payout multiplier
-    Money Payout,         // Win amount
-    IReadOnlyList<int>? Indices = null,   // Flat grid indices of winning symbols
-    int? PaylineId = null,                // Payline ID (1-10) that this win occurred on
-    IReadOnlyList<WinCoordinate>? Coordinates = null); // X/Y coordinates for frontend animation
-
-/// <summary>
-/// Coordinate for a winning symbol position.
-/// X = column (reel), Y = row
-/// </summary>
-public sealed record WinCoordinate(int X, int Y);
+    string SymbolCode,
+    int Count,
+    decimal Multiplier,
+    Money Payout,
+    IReadOnlyList<int>? Indices = null,
+    int? PaylineId = null); // Payline ID (1-10) that this win occurred on
 
 public sealed record ScatterOutcome(int SymbolCount, Money Win, int FreeSpinsAwarded);
 
@@ -129,19 +96,4 @@ public sealed record FeatureOutcome(
     IReadOnlyList<int>? LockedReels = null, // Locked reel indices (0-based: 1,2,3 = reels 2,3,4)
     IReadOnlyList<ExpandingWildInfo>? ExpandingWilds = null, // Expanding wilds with row information
     IReadOnlyList<int>? InitialGrid = null); // Initial grid state before wild expansion (for frontend animation)
-
-/// <summary>
-/// Feature state inside results for safe forwarding to frontend.
-/// The RGS platform forwards results as-is, so feature state here is guaranteed to reach the client.
-/// This is the recommended place for frontend to read feature state.
-/// </summary>
-public sealed record ResultsFeature(
-    string Type,              // Feature type (e.g., "EXPANDING_WILDS", "none")
-    bool Active,              // Whether the feature is currently active
-    int RespinsAwarded,       // Total respins awarded
-    int RespinsRemaining,     // Respins remaining
-    int IsClosure,            // 1 if last round of feature, 0 otherwise (duplicated from top-level for safe forwarding)
-    IReadOnlyList<int>? LockedReels = null,           // Locked reel indices (0-based)
-    IReadOnlyList<ExpandingWildInfo>? ExpandingWilds = null,  // Expanding wilds info
-    IReadOnlyList<int>? InitialGridSymbols = null);   // Grid state before wild expansion
 
